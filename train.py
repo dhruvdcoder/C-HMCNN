@@ -1,7 +1,7 @@
 import os
 import importlib
 os.environ["DATA_FOLDER"] = "./"
-
+import wandb
 import argparse
 
 import torch
@@ -72,7 +72,7 @@ class ConstrainedFFNNModel(nn.Module):
         return constrained_out
 
 def main():
-
+    wandb.init(project='multilabel-learning-datsets2', entity='iesl-boxes')
     # Training settings
     parser = argparse.ArgumentParser(description='Train neural network')
     
@@ -104,11 +104,11 @@ def main():
 
     args = parser.parse_args()
     hyperparams = {'batch_size':args.batch_size, 'num_layers':args.num_layers, 'dropout':args.dropout, 'non_lin':args.non_lin, 'hidden_dim':args.hidden_dim, 'lr':args.lr, 'weight_decay':args.weight_decay}
-
+    wandb.log(hyperparams)
     assert('_' in args.dataset)
     assert('FUN' in args.dataset or 'GO' in args.dataset or 'others' in args.dataset)
 
-
+    
     # Load train, val and test set
     dataset_name = args.dataset
     data = dataset_name.split('_')[0]
@@ -138,11 +138,11 @@ def main():
     # Load the datasets
     if ('others' in args.dataset):
         train, test = initialize_other_dataset(dataset_name, datasets)
-        train.to_eval, test.to_eval = torch.tensor(train.to_eval, dtype=torch.uint8),  torch.tensor(test.to_eval, dtype=torch.uint8)
+        train.to_eval, test.to_eval = torch.tensor(train.to_eval, dtype=torch.bool),  torch.tensor(test.to_eval, dtype=torch.bool)
         train.X, valX, train.Y, valY = train_test_split(train.X, train.Y, test_size=0.30, random_state=seed)
     else:
         train, val, test = initialize_dataset(dataset_name, datasets)
-        train.to_eval, val.to_eval, test.to_eval = torch.tensor(train.to_eval, dtype=torch.uint8), torch.tensor(val.to_eval, dtype=torch.uint8), torch.tensor(test.to_eval, dtype=torch.uint8)
+        train.to_eval, val.to_eval, test.to_eval = torch.tensor(train.to_eval, dtype=torch.bool), torch.tensor(val.to_eval, dtype=torch.bool), torch.tensor(test.to_eval, dtype=torch.bool)
     
     different_from_0 = torch.tensor(np.array((test.Y.sum(0)!=0), dtype = np.uint8), dtype=torch.uint8)
 
@@ -172,7 +172,11 @@ def main():
         imp_mean = SimpleImputer(missing_values=np.nan, strategy='mean').fit(np.concatenate((train.X, val.X)))
         val.X, val.Y = torch.tensor(scaler.transform(imp_mean.transform(val.X))).to(device), torch.tensor(val.Y).to(device)
         train.X, train.Y = torch.tensor(scaler.transform(imp_mean.transform(train.X))).to(device), torch.tensor(train.Y).to(device)        
-
+    test.X, test.Y = torch.tensor(scaler.transform(imp_mean.transform(test.X))).to(device), torch.tensor(test.Y).to(device)
+    test_dataset = [(x, y) for (x, y) in zip(test.X, test.Y)]
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, 
+                                            batch_size=args.batch_size, 
+                                            shuffle=False)
     # Create loaders 
     train_dataset = [(x, y) for (x, y) in zip(train.X, train.Y)]
     if ('others' in args.dataset):
@@ -202,19 +206,22 @@ def main():
     criterion = nn.BCELoss()
 
     # Set patience 
-    patience, max_patience = 20, 20
+    patience, max_patience = 7, 10
     max_score = 0.0
 
     # Create folder for the dataset (if it does not exist)
     if not os.path.exists('logs/'+str(dataset_name)+'/'):
          os.makedirs('logs/'+str(dataset_name)+'/')
-
+    best_validation_micro_map = 0
+    best_validation_samples_map = 0
+    best_test_micro_map = 0
+    best_test_samples_map = 0
     for epoch in range(num_epochs):
         total_train = 0.0
         correct_train = 0.0
         model.train()
 
-        train_score = 0
+        train_micro_map = 0
 
         for i, (x, labels) in enumerate(train_loader):
 
@@ -235,7 +242,7 @@ def main():
             total_train += labels.size(0) * labels.size(1)
             # Total correct predictions
             correct_train += (predicted == labels.byte()).sum()
-                    
+            wandb.log({"epoch": epoch, "loss": loss.item()})          
             # Getting gradients w.r.t. parameters
             loss.backward()
             # Updating parameters
@@ -244,7 +251,8 @@ def main():
         model.eval()
         constr_output = constr_output.to('cpu')
         labels = labels.to('cpu')
-        train_score = average_precision_score(labels[:,train.to_eval], constr_output.data[:,train.to_eval], average='micro') 
+        train_micro_map = average_precision_score(labels[:,train.to_eval], constr_output.data[:,train.to_eval], average='micro') 
+        train_samples_map = average_precision_score(labels[:,train.to_eval], constr_output.data[:,train.to_eval], average='samples')
 
         for i, (x,y) in enumerate(val_loader):
             x = x.to(device)
@@ -268,17 +276,53 @@ def main():
                 constr_val = torch.cat((constr_val, cpu_constrained_output), dim=0)
                 y_val = torch.cat((y_val, y), dim =0)
 
-        score = average_precision_score(y_val[:,train.to_eval], constr_val.data[:,train.to_eval], average='micro') 
+        val_micro_map = average_precision_score(y_val[:,train.to_eval], constr_val.data[:,train.to_eval], average='micro') 
+        val_samples_map = average_precision_score(y_val[:,train.to_eval], constr_val.data[:,train.to_eval], average='samples')
         
-        if score >= max_score:
-            patience = max_patience
-            max_score = score
+        for i, (x,y) in enumerate(test_loader):
+
+            model.eval()
+                
+            x = x.to(device)
+            y = y.to(device)
+
+            constrained_output = model(x.float())
+            predicted = constrained_output.data > 0.5
+            # Total number of labels
+            total = y.size(0) * y.size(1)
+            # Total correct predictions
+            correct = (predicted == y.byte()).sum()
+
+            #Move output and label back to cpu to be processed by sklearn
+            predicted = predicted.to('cpu')
+            cpu_constrained_output = constrained_output.to('cpu')
+            y = y.to('cpu')
+
+            if i == 0:
+                predicted_test = predicted
+                constr_test = cpu_constrained_output
+                y_test = y
+            else:
+                predicted_test = torch.cat((predicted_test, predicted), dim=0)
+                constr_test = torch.cat((constr_test, cpu_constrained_output), dim=0)
+                y_test = torch.cat((y_test, y), dim =0)
+
+
+        test_micro_map = average_precision_score(y_test[:,test.to_eval], constr_test.data[:,test.to_eval], average='micro')
+        test_samples_map = average_precision_score(y_test[:,test.to_eval], constr_test.data[:,test.to_eval], average='samples')
+        if val_micro_map > best_validation_micro_map:
+           best_validation_micro_map = val_micro_map
+           best_validation_samples_map = val_samples_map
+           best_test_micro_map = test_micro_map
+           best_test_samples_map = test_samples_map
+           patience = max_patience
         else:
-            patience = patience - 1
-        
+           patience = patience - 1
+
+        wandb.log({"epoch": epoch, "best_validation_micro_map": best_validation_micro_map, "best_validation_samples_map": best_validation_samples_map, "samples_map": val_samples_map, "micro_map": val_micro_map, "accuracy_train":float(correct_train)/float(total_train), "accuracy": float(correct)/float(total), 'test_micro_map': test_micro_map,'test_samples_map': test_samples_map, 'best_test_micro_map': best_test_micro_map,'best_test_samples_map': best_test_samples_map})
         floss= open('logs/'+str(dataset_name)+'/measures_batch_size_'+str(args.batch_size)+'_lr_'+str(args.lr)+'_weight_decay_'+str(args.weight_decay)+'_seed_'+str(args.seed)+'_num_layers_'+str(args.num_layers)+'._hidden_dim_'+str(args.hidden_dim)+'_dropout_'+str(args.dropout)+'_'+args.non_lin, 'a')
-        floss.write('\nEpoch: {} - Loss: {:.4f}, Accuracy train: {:.5f}, Accuracy: {:.5f}, Precision score: ({:.5f})\n'.format(epoch,
-                    loss, float(correct_train)/float(total_train), float(correct)/float(total), score))
+        floss.write('\nEpoch: {} - Loss: {:.4f}, Accuracy train: {:.5f}, Accuracy: {:.5f}, micro_map: ({:.5f})\n'.format(epoch,
+                    loss, float(correct_train)/float(total_train), float(correct)/float(total), val_micro_map))
         floss.close()
 
         if patience == 0:
